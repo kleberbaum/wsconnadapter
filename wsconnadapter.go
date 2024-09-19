@@ -1,22 +1,24 @@
-// an adapter for representing WebSocket connection as a net.Conn
-// some caveats apply: https://github.com/gorilla/websocket/issues/441
-
-// Picked up just the adapter from https://github.com/function61/holepunch-server
-// Revision when file was picked up is 8f5e8775e813bbec97c09e7988c0c780486a9df2
-
-// The same file is present in a different repository here https://github.com/xandout/soxy
-// I am not sure if the holepunch-server and soxy are related or not. They are both distributed
-// with an Apache 2.0 license and are public.
-
 package wsconnadapter
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	//"github.com/sirupsen/logrus"
+)
+
+// an adapter for representing WebSocket connection as a net.Conn
+// some caveats apply: https://github.com/gorilla/websocket/issues/441
+
+var ErrUnexpectedMessageType = errors.New("unexpected websocket message type")
+
+const (
+	pongTimeout  = time.Second * 35
+	pingInterval = time.Second * 30
 )
 
 type Adapter struct {
@@ -24,12 +26,60 @@ type Adapter struct {
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
 	reader     io.Reader
+	stopPingCh chan struct{}
+	pongCh     chan bool
 }
 
-func NewAdapter(conn *websocket.Conn) *Adapter {
-	return &Adapter{
+func New(conn *websocket.Conn) *Adapter {
+	adapter := &Adapter{
 		conn: conn,
 	}
+
+	return adapter
+}
+
+func (a *Adapter) Ping() chan bool {
+	if a.pongCh != nil {
+		return a.pongCh
+	}
+
+	a.stopPingCh = make(chan struct{})
+	a.pongCh = make(chan bool)
+
+	timeout := time.AfterFunc(pongTimeout, func() {
+		_ = a.Close()
+	})
+
+	a.conn.SetPongHandler(func(data string) error {
+		timeout.Reset(pongTimeout)
+
+		// non-blocking channel write
+		select {
+		case a.pongCh <- true:
+		default:
+		}
+
+		return nil
+	})
+
+	// ping loop
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := a.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second)); err != nil {
+					//logrus.WithError(err).Error("Failed to write ping message")
+				}
+			case <-a.stopPingCh:
+				return
+			}
+		}
+	}()
+
+	return a.pongCh
 }
 
 func (a *Adapter) Read(b []byte) (int, error) {
@@ -38,24 +88,24 @@ func (a *Adapter) Read(b []byte) (int, error) {
 	defer a.readMutex.Unlock()
 
 	if a.reader == nil {
-		_, reader, err := a.conn.NextReader()
+		messageType, reader, err := a.conn.NextReader()
 		if err != nil {
 			return 0, err
 		}
 
+		if messageType != websocket.BinaryMessage {
+			return 0, ErrUnexpectedMessageType
+		}
+
 		a.reader = reader
 	}
-
-	// Removed messageType check to make sure it is binary. Our use for this adapter
-	// is to integrate it with WebSocket and then send STOMP traffic over it. It will
-	// be a text message. We don't want to restrict this to text only either.
 
 	bytesRead, err := a.reader.Read(b)
 	if err != nil {
 		a.reader = nil
 
 		// EOF for the current Websocket frame, more will probably come so..
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			// .. we must hide this from the caller since our semantics are a
 			// stream of bytes across many frames
 			err = nil
@@ -81,6 +131,15 @@ func (a *Adapter) Write(b []byte) (int, error) {
 }
 
 func (a *Adapter) Close() error {
+	select {
+	case <-a.stopPingCh:
+	default:
+		if a.stopPingCh != nil {
+			a.stopPingCh <- struct{}{}
+			close(a.stopPingCh)
+		}
+	}
+
 	return a.conn.Close()
 }
 
@@ -105,5 +164,8 @@ func (a *Adapter) SetReadDeadline(t time.Time) error {
 }
 
 func (a *Adapter) SetWriteDeadline(t time.Time) error {
+	a.writeMutex.Lock()
+	defer a.writeMutex.Unlock()
+
 	return a.conn.SetWriteDeadline(t)
 }

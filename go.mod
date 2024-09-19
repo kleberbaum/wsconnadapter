@@ -1,4 +1,4 @@
-module github.com/drio-ai/wsconnadapter
+module github.com/kleberbaum/wsconnadapter
 
 go 1.20
 
